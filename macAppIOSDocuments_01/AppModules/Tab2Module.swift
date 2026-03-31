@@ -224,6 +224,18 @@ final class SalaryStorage: ObservableObject {
     }
 }
 
+// MARK: - Extracted Hints (pre-verified values from PDF regex)
+
+/// Values extracted directly from PDF text with high-precision regex.
+/// When non-nil, these OVERRIDE GPT responses — regex is more reliable than LLM for known patterns.
+struct ExtractedHints {
+    var netto: Double?          // "Netto te betalen X,XX" — exact bank transfer amount
+    var bruto: Double?          // "Totaal bruto loon X,XX" — first column = this period
+    var nettoLoon: Double?      // "Netto loon X,XX" — net wage before allowances
+    var vergoedingen: Double?   // travel/cost reimbursement this period (nil = not found, 0 = confirmed absent)
+    var tax: Double?            // wage/income tax deducted
+}
+
 // MARK: - Tab2 Module (GPT-MODULAR)
 
 final class Tab2Module: BaseModule {
@@ -389,9 +401,11 @@ struct Tab2View: View {
 
     // Universal pre-extraction: finds the most critical values using broad patterns
     // that work across Dutch, English, German payslips from any company.
-    // GPT-4o gets these as verified anchors so it cannot pick wrong column values.
-    static func buildUserPrompt(_ pdfText: String) -> String {
-        var hints: [String] = []
+    // Returns both the prompt string AND extracted hint values.
+    // Swift code uses hints to OVERRIDE GPT when regex found a value — regex > LLM for known patterns.
+    static func buildUserPrompt(_ pdfText: String) -> (prompt: String, hints: ExtractedHints) {
+        var hintLines: [String] = []
+        var hints = ExtractedHints()
 
         func firstNum(_ s: String) -> String? {
             s.range(of: #"[\d]+[.,][\d]+"#, options: .regularExpression).map { String(s[$0]) }
@@ -401,7 +415,6 @@ struct Tab2View: View {
         }
 
         // 1. NET BANK TRANSFER (netto) — the amount the employee actually receives
-        //    Covers Dutch flex, Dutch standard, English, German formats
         let nettoPatterns = [
             #"Netto te betalen\s+[\d]+[.,][\d]+"#,
             #"Te betalen\s*€?\s*[\d]+[.,][\d]+\s*per Bank"#,
@@ -410,12 +423,11 @@ struct Tab2View: View {
             #"[Aa]uszahlungsbetrag\s*[\d]+[.,][\d]+"#,
             #"[Nn]et\s+salary\s+payable\s*[\d]+[.,][\d]+"#,
         ]
-        var nettoVal: Double = 0
         for p in nettoPatterns {
             if let m = pdfText.range(of: p, options: .regularExpression),
                let n = firstNum(String(pdfText[m])) {
-                hints.append("NET BANK TRANSFER (→ netto): \(n)")
-                nettoVal = toDouble(n)
+                hintLines.append("NET BANK TRANSFER (→ netto): \(n)")
+                hints.netto = toDouble(n)
                 break
             }
         }
@@ -432,57 +444,56 @@ struct Tab2View: View {
         for p in brutoPatterns {
             if let m = pdfText.range(of: p, options: .regularExpression),
                let n = firstNum(String(pdfText[m])) {
-                hints.append("GROSS SALARY (→ bruto): \(n)")
+                hintLines.append("GROSS SALARY (→ bruto): \(n)")
+                hints.bruto = toDouble(n)
                 break
             }
         }
 
         // 3. NET WAGE BEFORE ALLOWANCES (nettoLoon) — intermediate value before travel is added
-        var nettoLoonVal: Double = 0
         for p in [#"(?m)^Netto\s+loon\s+[\d]+[.,][\d]+"#, #"(?m)^Net\s+salary\s+[\d]+[.,][\d]+"#,
                   #"[Nn]etto\s+loon\s*:?\s*[\d]+[.,][\d]+"#] {
             if let m = pdfText.range(of: p, options: .regularExpression),
                let n = firstNum(String(pdfText[m])) {
-                hints.append("NET WAGE BEFORE ALLOWANCES (→ nettoLoon): \(n)")
-                nettoLoonVal = toDouble(n)
+                hintLines.append("NET WAGE BEFORE ALLOWANCES (→ nettoLoon): \(n)")
+                hints.nettoLoon = toDouble(n)
                 break
             }
         }
 
         // 4. TRAVEL / COST REIMBURSEMENT (vergoedingen)
-        //    Method A: find explicit travel/reimbursement line
-        //    Dutch payslips show: "Reiskostenvergoedingen X,XX X,XX" when it's in Mutatie (2 numbers)
-        //    If only 1 number → it's cumulative-only (not paid this period) → skip
-        var vergoedFound = false
-        // Look for travel lines INSIDE the payslip table (they have an RT code digit before amounts).
-        // Table format: "Reiskostenvergoedingen 7 108,46 108,46"  ← RT code "7", then 2 amounts
-        // Header format: "Reiskostenvergoedingen 108,46"           ← no RT code, 1 amount (skip)
-        // English table: "Travel allowance 7 121,90 121,90"        ← same structure
-        // \w+ ensures word-only match (no "week 12" etc.) so RT code digit follows immediately
+        // Table rows have RT code digit directly after description word:
+        //   "Reiskostenvergoedingen 7 108,46 108,46"  ← \w+ then digit then 2 amounts = Mutatie col
+        //   "Reiskostenvergoedingen week 12 ..."       ← \w+ then "week" (not digit) = header, skip
         let vergoedPatterns = [
             #"[Rr]eiskosten\w+\s+\d+[T*]?\s+([\d]+[.,][\d]+)\s+([\d]+[.,][\d]+)"#,
             #"[Tt]ravel\s+allowance\s+\d+[T*]?\s+([\d]+[.,][\d]+)\s+([\d]+[.,][\d]+)"#,
             #"[Ff]ahrgeld\w*\s+\d+[T*]?\s+([\d]+[.,][\d]+)\s+([\d]+[.,][\d]+)"#,
         ]
+        var vergoedFound = false
         for p in vergoedPatterns {
             if let m = pdfText.range(of: p, options: .regularExpression) {
                 let row = String(pdfText[m])
                 let allNums = row.matches(of: #/(\d+[.,]\d+)/#).compactMap { String(row[$0.range]) }
-                // first number = Mutatie column value
                 if let first = allNums.first {
-                    hints.append("TRAVEL REIMBURSEMENT (→ vergoedingen, MUTATIE): \(first)")
+                    hintLines.append("TRAVEL REIMBURSEMENT (→ vergoedingen, MUTATIE): \(first)")
+                    hints.vergoedingen = toDouble(first)
                     vergoedFound = true
                 }
                 break
             }
         }
-        // Method B: compute from nettoLoon if available
-        if !vergoedFound, nettoLoonVal > 0, nettoVal > nettoLoonVal + 0.01 {
-            let verg = nettoVal - nettoLoonVal
-            hints.append(String(format: "TRAVEL REIMBURSEMENT computed (netto - nettoLoon → vergoedingen): %.2f", verg))
+        // Method B: compute from nettoLoon when no explicit travel line found
+        if !vergoedFound, let nl = hints.nettoLoon, let nt = hints.netto, nt > nl + 0.01 {
+            let verg = nt - nl
+            hintLines.append(String(format: "TRAVEL REIMBURSEMENT computed (netto - nettoLoon → vergoedingen): %.2f", verg))
+            hints.vergoedingen = verg
             vergoedFound = true
         }
-        if !vergoedFound { hints.append("TRAVEL REIMBURSEMENT: 0") }
+        if !vergoedFound {
+            hintLines.append("TRAVEL REIMBURSEMENT: 0")
+            hints.vergoedingen = 0
+        }
 
         // 5. INCOME/WAGE TAX (tax) — always negative deduction
         let taxPatterns = [
@@ -497,13 +508,15 @@ struct Tab2View: View {
             if let m = pdfText.range(of: p, options: .regularExpression) {
                 let row = String(pdfText[m])
                 if let neg = row.range(of: #"-[\d]+[.,][\d]+"#, options: .regularExpression) {
-                    hints.append("INCOME TAX (→ tax, positive): \(String(row[neg]).replacingOccurrences(of: "-", with: ""))")
+                    let taxStr = String(row[neg]).replacingOccurrences(of: "-", with: "")
+                    hintLines.append("INCOME TAX (→ tax, positive): \(taxStr)")
+                    hints.tax = toDouble(taxStr)
                     taxFound = true
                     break
                 }
             }
         }
-        if !taxFound { hints.append("INCOME TAX: 0") }
+        if !taxFound { hintLines.append("INCOME TAX: 0") }
 
         // 6. DISABILITY / WGA insurance
         for p in [#"[Gg]ediff\.\s*premie\s*[Ww]hk[^\n]+-[\d]+[.,][\d]+"#,
@@ -511,7 +524,7 @@ struct Tab2View: View {
             if let m = pdfText.range(of: p, options: .regularExpression) {
                 let row = String(pdfText[m])
                 if let neg = row.range(of: #"-[\d]+[.,][\d]+"#, options: .regularExpression) {
-                    hints.append("WGA (→ wga, positive): \(String(row[neg]).replacingOccurrences(of: "-", with: ""))")
+                    hintLines.append("WGA (→ wga, positive): \(String(row[neg]).replacingOccurrences(of: "-", with: ""))")
                     break
                 }
             }
@@ -525,10 +538,9 @@ struct Tab2View: View {
             if let m = pdfText.range(of: p, options: .regularExpression) {
                 let mt = String(pdfText[m])
                 let nums = mt.matches(of: #/(\d+[.,]\d+)/#).compactMap { String(mt[$0.range]) }
-                // nums[0]=percentage, [1]=old, [2]=accrued, [3]=new  OR  [0]=old, [1]=accrued, [2]=new
                 let rel = nums.count > 3 ? Array(nums.dropFirst()) : nums
                 if rel.count >= 3 {
-                    hints.append("VACATION PAY: old=\(rel[0]) | ACCRUED_THIS_PERIOD(vakantiegeld)=\(rel[1]) | NEW_BALANCE(vacationPay)=\(rel[2])")
+                    hintLines.append("VACATION PAY: old=\(rel[0]) | ACCRUED_THIS_PERIOD(vakantiegeld)=\(rel[1]) | NEW_BALANCE(vacationPay)=\(rel[2])")
                 }
                 break
             }
@@ -541,7 +553,7 @@ struct Tab2View: View {
                 let mt = String(pdfText[m])
                 let times = mt.matches(of: #/(\d+:\d+)/#).prefix(3).compactMap { String(mt[$0.range]) }
                 if times.count >= 3 {
-                    hints.append("VACATION DAYS: old=\(times[0]) | accrued=\(times[1]) | NEW_BALANCE(vakantiedagen)=\(times[2])")
+                    hintLines.append("VACATION DAYS: old=\(times[0]) | accrued=\(times[1]) | NEW_BALANCE(vakantiedagen)=\(times[2])")
                 }
                 break
             }
@@ -553,7 +565,7 @@ struct Tab2View: View {
             if let m = pdfText.range(of: p, options: .regularExpression) {
                 let row = String(pdfText[m])
                 if let tr = row.range(of: #"\d+:\d+"#, options: .regularExpression) {
-                    hints.append("NORMAL HOURS (→ normalHours, convert HH:MM to decimal): \(row[tr])")
+                    hintLines.append("NORMAL HOURS (→ normalHours, convert HH:MM to decimal): \(row[tr])")
                 }
                 break
             }
@@ -571,23 +583,23 @@ struct Tab2View: View {
             }
             irrStart = m.upperBound
         }
-        if totalIrreg > 0 { hints.append(String(format: "IRREGULAR HOURS total (→ irregularHours): %.2f", totalIrreg)) }
+        if totalIrreg > 0 { hintLines.append(String(format: "IRREGULAR HOURS total (→ irregularHours): %.2f", totalIrreg)) }
 
         // 11. PAY PERIOD DATES
         for p in [#"[Pp]eriode?[:\s]+(\d{1,2}[-./]\d{1,2}[-./]\d{2,4})\s*(?:t/m|tot|until|-|–|to)\s*(\d{1,2}[-./]\d{1,2}[-./]\d{2,4})"#,
                   #"[Pp]eriod[:\s]+(\d{1,2}[-./]\d{1,2}[-./]\d{2,4})\s*(?:to|-|–)\s*(\d{1,2}[-./]\d{1,2}[-./]\d{2,4})"#,
                   #"[Zz]eitraum[:\s]+(\d{1,2}[-./]\d{1,2}[-./]\d{2,4})\s*(?:bis|-|–)\s*(\d{1,2}[-./]\d{1,2}[-./]\d{2,4})"#] {
             if let m = pdfText.range(of: p, options: .regularExpression) {
-                hints.append("PAY PERIOD: \(pdfText[m])")
+                hintLines.append("PAY PERIOD: \(pdfText[m])")
                 break
             }
         }
 
-        let header = hints.isEmpty ? "" :
+        let header = hintLines.isEmpty ? "" :
             "=== KEY VALUES (verified from PDF — use these as ground truth) ===\n"
-            + hints.joined(separator: "\n")
+            + hintLines.joined(separator: "\n")
             + "\n\n=== FULL PAYSLIP TEXT ===\n"
-        return header + String(pdfText.prefix(8000))
+        return (header + String(pdfText.prefix(8000)), hints)
     }
 
     private func extractDatesWithGPT() {
@@ -738,7 +750,7 @@ struct Tab2View: View {
                 ## ALL DEDUCTIONS are positive numbers. Missing = 0.0. Missing strings = "".
                 """
 
-                let userPrompt = Self.buildUserPrompt(pdfText)
+                let (userPrompt, extractedHints) = Self.buildUserPrompt(pdfText)
 
                 var req = URLRequest(url: URL(string: "https://api.openai.com/v1/chat/completions")!)
                 req.httpMethod = "POST"
@@ -783,24 +795,30 @@ struct Tab2View: View {
                 }
                 await MainActor.run { storage.update(updatedDoc) }
 
-                let bruto = num("bruto")
-                let rawNetto = num("netto")
-                let rawNettoLoon = num("nettoLoon")
-                let rawVergoedingen = num("vergoedingen")
+                let gptBruto = num("bruto")
+                let gptNetto = num("netto")
+                let gptNettoLoon = num("nettoLoon")
+                let gptVergoedingen = num("vergoedingen")
                 let toeslagen = num("toeslagen")
 
-                let netto: Double = rawNetto > 0 ? rawNetto : bruto
+                // Hint values override GPT when regex found them — regex is more reliable for known patterns.
+                // This is the primary safety layer that prevents GPT from picking the wrong column.
+                let bruto: Double = extractedHints.bruto ?? (gptBruto > 0 ? gptBruto : 0)
+                let netto: Double = extractedHints.netto ?? (gptNetto > 0 ? gptNetto : bruto)
 
-                // nettoLoon is invalid if GPT confused it with bruto/netto
+                // nettoLoon: prefer hint; fall back to GPT only if it's a valid intermediate value
                 let nettoLoon: Double = {
-                    guard rawNettoLoon > 0, rawNettoLoon < netto, rawNettoLoon != bruto else { return 0 }
-                    return rawNettoLoon
+                    if let hintNL = extractedHints.nettoLoon, hintNL > 0, hintNL < netto {
+                        return hintNL
+                    }
+                    guard gptNettoLoon > 0, gptNettoLoon < netto, gptNettoLoon != bruto else { return 0 }
+                    return gptNettoLoon
                 }()
 
-                // If netto > bruto and GPT missed vergoedingen (e.g. reiskosten not in MUTATIE),
-                // compute it automatically — the difference is logically travel allowance
+                // vergoedingen: prefer hint; compute from netto-nettoLoon as fallback
                 let vergoedingen: Double = {
-                    if rawVergoedingen > 0 { return rawVergoedingen }
+                    if let hintV = extractedHints.vergoedingen { return hintV }
+                    if gptVergoedingen > 0 { return gptVergoedingen }
                     let surplus = netto - bruto - toeslagen
                     return surplus > 0.5 ? surplus : 0
                 }()
