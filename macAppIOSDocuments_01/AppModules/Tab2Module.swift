@@ -451,18 +451,28 @@ struct Tab2View: View {
 
         // 4. TRAVEL / COST REIMBURSEMENT (vergoedingen)
         //    Method A: find explicit travel/reimbursement line
+        //    Dutch payslips show: "Reiskostenvergoedingen X,XX X,XX" when it's in Mutatie (2 numbers)
+        //    If only 1 number → it's cumulative-only (not paid this period) → skip
         var vergoedFound = false
+        // Look for travel lines INSIDE the payslip table (they have an RT code digit before amounts).
+        // Table format: "Reiskostenvergoedingen 7 108,46 108,46"  ← RT code "7", then 2 amounts
+        // Header format: "Reiskostenvergoedingen 108,46"           ← no RT code, 1 amount (skip)
+        // English table: "Travel allowance 7 121,90 121,90"        ← same structure
+        // \w+ ensures word-only match (no "week 12" etc.) so RT code digit follows immediately
         let vergoedPatterns = [
-            #"[Rr]eiskosten(?:vergoeding)?[^\n]+[\d]+[.,][\d]+"#,
-            #"[Tt]ravel\s+(?:allowance|reimbursement)[^\n]+[\d]+[.,][\d]+"#,
-            #"[Vv]ergoeding(?:en)?[^\n]+[\d]+[.,][\d]+"#,
-            #"[Ff]ahrgeld[^\n]+[\d]+[.,][\d]+"#,
+            #"[Rr]eiskosten\w+\s+\d+[T*]?\s+([\d]+[.,][\d]+)\s+([\d]+[.,][\d]+)"#,
+            #"[Tt]ravel\s+allowance\s+\d+[T*]?\s+([\d]+[.,][\d]+)\s+([\d]+[.,][\d]+)"#,
+            #"[Ff]ahrgeld\w*\s+\d+[T*]?\s+([\d]+[.,][\d]+)\s+([\d]+[.,][\d]+)"#,
         ]
         for p in vergoedPatterns {
-            if let m = pdfText.range(of: p, options: .regularExpression),
-               let n = firstNum(String(pdfText[m])) {
-                hints.append("TRAVEL REIMBURSEMENT (→ vergoedingen): \(n)")
-                vergoedFound = true
+            if let m = pdfText.range(of: p, options: .regularExpression) {
+                let row = String(pdfText[m])
+                let allNums = row.matches(of: #/(\d+[.,]\d+)/#).compactMap { String(row[$0.range]) }
+                // first number = Mutatie column value
+                if let first = allNums.first {
+                    hints.append("TRAVEL REIMBURSEMENT (→ vergoedingen, MUTATIE): \(first)")
+                    vergoedFound = true
+                }
                 break
             }
         }
