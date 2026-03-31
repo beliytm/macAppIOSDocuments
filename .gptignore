@@ -1,0 +1,9 @@
+# Files GPT should NOT read (saves tokens)
+_ref/
+*.xcuserstate
+*.xcuserdatad/
+DerivedData/
+build/
+*.png
+*.jpg
+Pods/
