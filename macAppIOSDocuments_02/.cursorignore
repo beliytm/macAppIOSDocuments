@@ -1,0 +1,15 @@
+_ref/
+*.xcuserstate
+*.xcuserdatad/
+DerivedData/
+build/
+*.ipa
+*.dSYM.zip
+*.dSYM
+*.png
+*.jpg
+*.ico
+*.icns
+logs/*.log
+Pods/
+.build/
